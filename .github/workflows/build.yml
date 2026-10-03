@@ -1,0 +1,335 @@
+name: 构建与验收 Nextcloud FPM 底座
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .github/workflows/build.yml
+  pull_request:
+    paths:
+      - Dockerfile
+      - .github/workflows/build.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  TEST_IMAGE: localhost/nextcloud-fpm-base:ci
+  TEST_CONTAINER: nc-fpm-ro-test
+  SERIES_TAG: 8.4-alpine3.23
+
+jobs:
+  build-check-publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: 获取仓库文件
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: 准备本轮目录与构建标识
+        run: |
+          set -euo pipefail
+          CI_ROOT="$(mktemp -d "$RUNNER_TEMP/nextcloud-fpm-ci.XXXXXX")"
+          REPORT_DIR="$CI_ROOT/report"
+          mkdir -p "$REPORT_DIR" "$CI_ROOT/mock/volume" "$CI_ROOT/mock/app"
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          BUILD_TAG="build-$(date -u +%Y%m%dT%H%M%SZ)-${SOURCE_COMMIT:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          {
+            printf 'CI_ROOT=%s\n' "$CI_ROOT"
+            printf 'REPORT_DIR=%s\n' "$REPORT_DIR"
+            printf 'IMAGE_NAME=%s\n' "$IMAGE_NAME"
+            printf 'SOURCE_COMMIT=%s\n' "$SOURCE_COMMIT"
+            printf 'CREATED=%s\n' "$CREATED"
+            printf 'BUILD_TAG=%s\n' "$BUILD_TAG"
+          } >> "$GITHUB_ENV"
+          {
+            printf 'repository=%s\ncommit=%s\ncreated=%s\n' "$GITHUB_REPOSITORY" "$SOURCE_COMMIT" "$CREATED"
+            printf 'platform=linux/amd64\nimage=%s\nbuild_tag=%s\n' "$IMAGE_NAME" "$BUILD_TAG"
+            id
+            docker version
+            docker buildx version
+          } | tee "$REPORT_DIR/context.txt"
+          test -f Dockerfile
+          cp Dockerfile "$REPORT_DIR/Dockerfile"
+          sha256sum Dockerfile | tee "$REPORT_DIR/dockerfile-sha256.txt"
+
+      - name: 构建一次并加载到本地 Docker
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/amd64 \
+            --pull \
+            --no-cache \
+            --load \
+            --progress plain \
+            --iidfile "$REPORT_DIR/buildx-id.txt" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \
+            --label "org.opencontainers.image.created=$CREATED" \
+            --tag "$TEST_IMAGE" \
+            --file Dockerfile . 2>&1 | tee "$REPORT_DIR/build.log"
+          docker image inspect "$TEST_IMAGE" > "$REPORT_DIR/image-inspect.json"
+          docker image inspect --format '{{.Id}}' "$TEST_IMAGE" | tee "$REPORT_DIR/image-id.txt"
+          test "$(docker image inspect --format '{{.Architecture}}' "$TEST_IMAGE")" = amd64
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$TEST_IMAGE")" = '["/entrypoint.sh"]'
+          test "$(docker image inspect --format '{{json .Config.Cmd}}' "$TEST_IMAGE")" = '["/usr/bin/supervisord","-c","/supervisord.conf"]'
+
+      - name: 检查 PHP 版本、扩展与运行能力
+        run: |
+          set -Eeuo pipefail
+          trap 'rc=$?; printf "[失败] line=%s exit=%s command=%s\n" "$LINENO" "$rc" "$BASH_COMMAND" | tee -a "$REPORT_DIR/failures.txt"; exit "$rc"' ERR
+          printf '\n[01] PHP 版本与模块\n'
+          docker run --rm "$TEST_IMAGE" php -v | tee "$REPORT_DIR/php-version.txt"
+          docker run --rm "$TEST_IMAGE" php -r 'exit(PHP_MAJOR_VERSION === 8 && PHP_MINOR_VERSION === 4 ? 0 : 1);'
+          docker run --rm "$TEST_IMAGE" php -m | tee "$REPORT_DIR/php-modules.txt"
+          for module in apcu bcmath exif gd gmp igbinary imagick intl pcntl pdo_pgsql redis sysvsem zip; do
+            grep -Fx "$module" "$REPORT_DIR/php-modules.txt" >/dev/null
+            printf '[通过] 扩展存在：%s\n' "$module"
+          done
+          grep -Fx 'Zend OPcache' "$REPORT_DIR/php-modules.txt" >/dev/null
+          for module in pdo_mysql ldap memcached ftp; do
+            if grep -Fx "$module" "$REPORT_DIR/php-modules.txt" >/dev/null; then
+              printf '[失败] 出现设计排除的扩展：%s\n' "$module" >&2
+              exit 1
+            fi
+          done
+
+          printf '\n[02] Redis 序列化与压缩支持\n'
+          docker run --rm "$TEST_IMAGE" php --ri redis | tee "$REPORT_DIR/redis.txt"
+          grep -Fx 'Redis Support => enabled' "$REPORT_DIR/redis.txt" >/dev/null
+          grep -E '^Available serializers => .*igbinary' "$REPORT_DIR/redis.txt" >/dev/null
+          grep -E '^Available compression => .*zstd' "$REPORT_DIR/redis.txt" >/dev/null
+          grep -E '^Available compression => .*lz4' "$REPORT_DIR/redis.txt" >/dev/null
+
+          printf '\n[03] Imagick 与 OPcache\n'
+          docker run --rm "$TEST_IMAGE" php --ri imagick | tee "$REPORT_DIR/imagick.txt"
+          grep -Fx 'imagick module => enabled' "$REPORT_DIR/imagick.txt" >/dev/null
+          docker run --rm "$TEST_IMAGE" php --ri 'Zend OPcache' | tee "$REPORT_DIR/opcache.txt"
+          grep -Fx 'Opcode Caching => Up and Running' "$REPORT_DIR/opcache.txt" >/dev/null
+          grep -Fx 'opcache.enable => On => On' "$REPORT_DIR/opcache.txt" >/dev/null
+
+          printf '\n[04] PHP 有效参数报告\n'
+          docker run --rm "$TEST_IMAGE" php -i > "$REPORT_DIR/php-info.txt"
+          grep -Ei 'memory_limit|upload_max_filesize|post_max_size|apc.enable_cli|apc.serializer|session.serialize_handler|opcache.memory_consumption|opcache.revalidate_freq' "$REPORT_DIR/php-info.txt"
+
+      - name: 检查 FPM 配置与镜像职责边界
+        run: |
+          set -Eeuo pipefail
+          trap 'rc=$?; printf "[失败] line=%s exit=%s command=%s\n" "$LINENO" "$rc" "$BASH_COMMAND" | tee -a "$REPORT_DIR/failures.txt"; exit "$rc"' ERR
+          printf '\n[05] FPM 合并后的有效配置\n'
+          docker run --rm "$TEST_IMAGE" php-fpm -tt 2>&1 | tee "$REPORT_DIR/fpm-config.txt"
+          for expected in \
+            'configuration file /usr/local/etc/php-fpm.conf test is successful' \
+            'listen = 9000' \
+            'daemonize = no' \
+            'user = www-data' \
+            'group = www-data' \
+            'slowlog = /var/tmp/nextcloud/app/log/php-fpm-slow.log' \
+            'php_admin_value[sys_temp_dir] = /var/tmp/nextcloud/app/php' \
+            'php_admin_value[upload_tmp_dir] = /var/tmp/nextcloud/app/php-upload'; do
+            grep -F "$expected" "$REPORT_DIR/fpm-config.txt" >/dev/null
+          done
+          for obsolete in \
+            /mnt/ncdata /var/nextcloud /var/lib/nextcloud/local/data \
+            /var/www/html /var/www/nextcloud /var/local/nextcloud \
+            /var/tmp/nextcloud/php /var/tmp/nextcloud/log/php-fpm-slow.log \
+            /var/log/php-fpm-nextcloud-slow.log; do
+            if grep -F "$obsolete" "$REPORT_DIR/fpm-config.txt" >/dev/null; then
+              printf '[失败] FPM 配置仍引用旧路径：%s\n' "$obsolete" >&2
+              exit 1
+            fi
+          done
+
+          printf '\n[06] 绕过 entrypoint 检查镜像原始内容\n'
+          docker run --rm --entrypoint sh "$TEST_IMAGE" -eu -c '
+            for path in \
+              /var/lib/nextcloud/releases /var/lib/nextcloud/web \
+              /var/lib/nextcloud/local /var/lib/nextcloud/data \
+              /etc/crontabs/www-data \
+              /var/tmp/nextcloud/app/php /var/tmp/nextcloud/app/php-upload \
+              /var/tmp/nextcloud/app/nextcloud /var/tmp/nextcloud/app/log \
+              /var/tmp/nextcloud/app/run; do
+              test ! -e "$path"
+              test ! -L "$path"
+            done
+          '
+
+      - name: 检查只读运行、目录准备与实际写入
+        run: |
+          set -Eeuo pipefail
+          trap 'rc=$?; printf "[失败] line=%s exit=%s command=%s\n" "$LINENO" "$rc" "$BASH_COMMAND" | tee -a "$REPORT_DIR/failures.txt"; exit "$rc"' ERR
+          printf '\n[07] 使用空挂载目录启动只读容器\n'
+          docker run -d --name "$TEST_CONTAINER" \
+            --read-only \
+            --cap-drop=NET_RAW \
+            --cap-drop=MKNOD \
+            --cap-drop=SETFCAP \
+            --cap-drop=SYS_CHROOT \
+            --security-opt=no-new-privileges \
+            --tmpfs /tmp:rw,mode=1777,size=64m \
+            --tmpfs /run:rw,size=16m \
+            --mount "type=bind,src=$CI_ROOT/mock/volume,dst=/var/lib/nextcloud" \
+            --mount "type=bind,src=$CI_ROOT/mock/app,dst=/var/tmp/nextcloud/app" \
+            "$TEST_IMAGE" | tee "$REPORT_DIR/container-id.txt"
+
+          ready=no
+          for attempt in $(seq 1 30); do
+            if [ "$(docker inspect --format '{{.State.Running}}' "$TEST_CONTAINER")" != true ]; then
+              printf '[失败] 测试容器已退出\n' >&2
+              exit 1
+            fi
+            docker exec "$TEST_CONTAINER" ps aux > "$REPORT_DIR/processes.txt"
+            if grep -F supervisord "$REPORT_DIR/processes.txt" >/dev/null && \
+               grep -F 'php-fpm: master process' "$REPORT_DIR/processes.txt" >/dev/null && \
+               grep -F 'php-fpm: pool www' "$REPORT_DIR/processes.txt" >/dev/null && \
+               grep -F 'busybox crond -f -L /dev/stdout' "$REPORT_DIR/processes.txt" >/dev/null; then
+              ready=yes
+              break
+            fi
+            sleep 2
+          done
+          cat "$REPORT_DIR/processes.txt"
+          test "$ready" = yes
+          docker exec "$TEST_CONTAINER" netstat -ltnp | tee "$REPORT_DIR/listening.txt"
+          grep -E '[:.]9000[[:space:]]' "$REPORT_DIR/listening.txt" >/dev/null
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$TEST_CONTAINER")" = true
+
+          printf '\n[08] 检查 entrypoint 未创建实例业务，运行目录已建立\n'
+          docker exec -i "$TEST_CONTAINER" sh -eu <<'SH'
+          test "$(id -u www-data)" = 82
+          test "$(id -g www-data)" = 82
+          test -z "$(find /var/lib/nextcloud -mindepth 1 -maxdepth 1 -print)"
+          test ! -e /etc/crontabs/www-data
+          test -s /run/supervisord.pid
+          for path in php php-upload nextcloud log run; do
+            test -d "/var/tmp/nextcloud/app/$path"
+            ls -ldn "/var/tmp/nextcloud/app/$path"
+          done
+          SH
+
+          printf '\n[09] 建立最小持久目录测试夹具\n'
+          docker exec -i "$TEST_CONTAINER" sh -eu <<'SH'
+          mkdir -p /var/lib/nextcloud/local/config \
+            /var/lib/nextcloud/local/custom_apps \
+            /var/lib/nextcloud/local/themes /var/lib/nextcloud/data
+          chown -R www-data:www-data /var/lib/nextcloud/local /var/lib/nextcloud/data
+          chmod 0755 /var/lib/nextcloud /var/lib/nextcloud/local \
+            /var/lib/nextcloud/local/custom_apps /var/lib/nextcloud/local/themes
+          chmod 0750 /var/lib/nextcloud/local/config /var/lib/nextcloud/data
+          SH
+
+          printf '\n[10] www-data 实际写入检查\n'
+          docker exec -i --user 82:82 "$TEST_CONTAINER" sh -eu <<'SH'
+          for path in \
+            /var/lib/nextcloud/local/config \
+            /var/lib/nextcloud/local/custom_apps \
+            /var/lib/nextcloud/local/themes /var/lib/nextcloud/data \
+            /var/tmp/nextcloud/app/php /var/tmp/nextcloud/app/php-upload \
+            /var/tmp/nextcloud/app/nextcloud /var/tmp/nextcloud/app/log \
+            /var/tmp/nextcloud/app/run; do
+            printf 'ok\n' > "$path/.write-test"
+            test "$(cat "$path/.write-test")" = ok
+            printf '[通过] 可写：%s\n' "$path"
+          done
+          SH
+
+          printf '\n[11] 根文件系统写入必须因只读而失败\n'
+          if docker exec "$TEST_CONTAINER" sh -eu -c 'printf bad > /root/should-not-write' \
+            > "$REPORT_DIR/rootfs-negative.txt" 2>&1; then
+            printf '[失败] 只读根文件系统竟然允许写入\n' >&2
+            exit 1
+          fi
+          cat "$REPORT_DIR/rootfs-negative.txt"
+          grep -F 'Read-only file system' "$REPORT_DIR/rootfs-negative.txt" >/dev/null
+
+          printf '\n[12] 不伪造 Nextcloud 安装状态\n'
+          docker exec -i "$TEST_CONTAINER" sh -eu <<'SH'
+          test ! -e /var/lib/nextcloud/local/config/config.php
+          test ! -e /var/lib/nextcloud/data/.ncdata
+          test ! -e /var/lib/nextcloud/web
+          test -z "$(find /var/lib/nextcloud/data -maxdepth 1 -type d -name 'appdata_*' -print)"
+          SH
+          printf '所有镜像检查通过\n' | tee "$REPORT_DIR/check-result.txt"
+
+      - name: 无论成功失败均采集诊断
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          if [ -n "${REPORT_DIR:-}" ] && [ -d "$REPORT_DIR" ]; then
+            docker image inspect "$TEST_IMAGE" > "$REPORT_DIR/image-final.json" 2>&1 || true
+            if docker inspect "$TEST_CONTAINER" > "$REPORT_DIR/container-inspect.json" 2>&1; then
+              docker logs --tail 120 "$TEST_CONTAINER" > "$REPORT_DIR/container-logs.txt" 2>&1 || true
+              cat "$REPORT_DIR/container-logs.txt"
+              docker exec "$TEST_CONTAINER" ps aux > "$REPORT_DIR/processes-final.txt" 2>&1 || true
+            fi
+            docker run --rm --entrypoint sh "$TEST_IMAGE" -eu -c '
+              cat /entrypoint.sh /supervisord.conf /usr/local/etc/php-fpm.d/www.conf
+            ' > "$REPORT_DIR/runtime-configs.txt" 2>&1 || true
+          fi
+
+      - name: 清理测试容器与模拟目录
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          docker rm -f "$TEST_CONTAINER" >/dev/null 2>&1 || true
+          if [ -n "${CI_ROOT:-}" ] && [ -d "$CI_ROOT/mock" ]; then
+            sudo rm -rf -- "$CI_ROOT/mock"
+          fi
+
+      - name: 发布同一镜像到 GHCR
+        if: success() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -f "$REPORT_DIR/check-result.txt"
+          IMAGE_ID="$(cat "$REPORT_DIR/image-id.txt")"
+          test "$(docker image inspect --format '{{.Id}}' "$TEST_IMAGE")" = "$IMAGE_ID"
+          printf '%s\n' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag "$IMAGE_ID" "$IMAGE_NAME:$BUILD_TAG"
+          docker tag "$IMAGE_ID" "$IMAGE_NAME:$SERIES_TAG"
+          docker push "$IMAGE_NAME:$BUILD_TAG" 2>&1 | tee "$REPORT_DIR/push-build.txt"
+          docker push "$IMAGE_NAME:$SERIES_TAG" 2>&1 | tee "$REPORT_DIR/push-series.txt"
+          DIGEST="$(sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' "$REPORT_DIR/push-build.txt" | tail -n 1)"
+          test -n "$DIGEST"
+          {
+            printf 'image=%s\nbuild_tag=%s\nseries_tag=%s\n' "$IMAGE_NAME" "$BUILD_TAG" "$SERIES_TAG"
+            printf 'image_id=%s\ndigest=%s\npull_reference=%s@%s\n' "$IMAGE_ID" "$DIGEST" "$IMAGE_NAME" "$DIGEST"
+          } | tee "$REPORT_DIR/published.txt"
+          {
+            printf '镜像检查通过并已发布。\n\n'
+            printf -- '- 构建标签：`%s:%s`\n' "$IMAGE_NAME" "$BUILD_TAG"
+            printf -- '- 系列标签：`%s:%s`\n' "$IMAGE_NAME" "$SERIES_TAG"
+            printf -- '- 固定引用：`%s@%s`\n' "$IMAGE_NAME" "$DIGEST"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 退出 registry 登录
+        if: always()
+        continue-on-error: true
+        run: docker logout ghcr.io
+
+      - name: 保存本轮构建与检查报告
+        if: always() && env.REPORT_DIR != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextcloud-fpm-base-amd64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.REPORT_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
