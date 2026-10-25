@@ -23,7 +23,7 @@ permissions:
 env:
   TEST_IMAGE: localhost/nextcloud-fpm-base:ci
   TEST_CONTAINER: nc-fpm-ro-test
-  SERIES_TAG: 8.4-alpine3.23
+  SERIES_TAG: 8.5-alpine3.23
 
 jobs:
   build-check-publish:
@@ -95,7 +95,7 @@ jobs:
           trap 'rc=$?; printf "[失败] line=%s exit=%s command=%s\n" "$LINENO" "$rc" "$BASH_COMMAND" | tee -a "$REPORT_DIR/failures.txt"; exit "$rc"' ERR
           printf '\n[01] PHP 版本与模块\n'
           docker run --rm "$TEST_IMAGE" php -v | tee "$REPORT_DIR/php-version.txt"
-          docker run --rm "$TEST_IMAGE" php -r 'exit(PHP_MAJOR_VERSION === 8 && PHP_MINOR_VERSION === 4 ? 0 : 1);'
+          docker run --rm "$TEST_IMAGE" php -r 'exit(PHP_MAJOR_VERSION === 8 && PHP_MINOR_VERSION === 5 ? 0 : 1);'
           docker run --rm "$TEST_IMAGE" php -m | tee "$REPORT_DIR/php-modules.txt"
           for module in apcu bcmath exif gd gmp igbinary imagick intl pcntl pdo_pgsql redis sysvsem zip; do
             grep -Fx "$module" "$REPORT_DIR/php-modules.txt" >/dev/null
